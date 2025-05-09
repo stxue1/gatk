@@ -1,17 +1,29 @@
 version 1.0
 
-import "AlignmentPipeline.wdl" as AlignAndMarkDuplicates
+import "AlignAndCall.wdl" as AlignAndCall
 
-#import "https://api.firecloud.org/ga4gh/v1/tools/mitochondria:AlignmentPipeline/versions/1/plain-WDL/descriptor" as AlignAndMarkDuplicates
+#import "https://api.firecloud.org/ga4gh/v1/tools/mitochondria:AlignAndCall/versions/23/plain-WDL/descriptor" as AlignAndCall
 
-workflow AlignAndCall {
+workflow MitochondriaPipeline {
+
   meta {
-    description: "Takes in unmapped bam and outputs VCF of SNP/Indel calls on the mitochondria."
+    description: "Takes in an hg38 bam or cram and outputs VCF of SNP/Indel calls on the mitochondria."
+    allowNestedInputs: true
   }
 
   input {
-    File unmapped_bam
-    String base_name
+    File wgs_aligned_input_bam_or_cram
+    File wgs_aligned_input_bam_or_cram_index
+    String contig_name = "chrM"
+
+    # Read length used for optimization only. If this is too small CollectWgsMetrics might fail, but the results are not
+    # affected by this number. Default is 151.
+    Int? max_read_length
+
+    # Full reference is only requred if starting with a CRAM (BAM doesn't need these files)
+    File? ref_fasta
+    File? ref_fasta_index
+    File? ref_dict
 
     File mt_dict
     File mt_fasta
@@ -37,30 +49,58 @@ workflow AlignAndCall {
 
     File shift_back_chain
 
+    File control_region_shifted_reference_interval_list
+    File non_control_region_interval_list
+
+    String? requester_pays_project
     File? gatk_override
     String? gatk_docker_override
     String? m2_extra_args
     String? m2_filter_extra_args
     Float? vaf_filter_threshold
     Float? f_score_beta
-    Boolean compress_output_vcf
     Float? verifyBamID
-
-    # Read length used for optimization only. If this is too small CollectWgsMetrics might fail, but the results are not
-    # affected by this number. Default is 151.
-    Int? max_read_length
+    Boolean compress_output_vcf = false
 
     #Optional runtime arguments
     Int? preemptible_tries
   }
 
   parameter_meta {
-    unmapped_bam: "Unmapped and subset bam, optionally with original alignment (OA) tag"
+    wgs_aligned_input_bam_or_cram: "Full WGS hg38 bam or cram"
+    out_vcf: "Final VCF of mitochondrial SNPs and INDELs"
+    vaf_filter_threshold: "Hard threshold for filtering low VAF sites"
+    f_score_beta: "F-Score beta balances the filtering strategy between recall and precision. The relative weight of recall to precision."
+    contig_name: "Name of mitochondria contig in reference that wgs_aligned_input_bam_or_cram is aligned to"
   }
 
-  call AlignAndMarkDuplicates.AlignmentPipeline as AlignToMt {
+  call SubsetBamToChrM {
     input:
-      input_bam = unmapped_bam,
+      input_bam = wgs_aligned_input_bam_or_cram,
+      input_bai = wgs_aligned_input_bam_or_cram_index,
+      contig_name = contig_name,
+      ref_fasta = ref_fasta,
+      ref_fasta_index = ref_fasta_index,
+      ref_dict = ref_dict,
+      requester_pays_project = requester_pays_project,
+      gatk_override = gatk_override,
+      gatk_docker_override = gatk_docker_override,
+      preemptible_tries = preemptible_tries
+  }
+
+  call RevertSam {
+    input:
+      input_bam = SubsetBamToChrM.output_bam,
+      preemptible_tries = preemptible_tries
+  }
+
+  String base_name = basename(SubsetBamToChrM.output_bam, ".bam")
+
+
+  call AlignAndCall.AlignAndCall as AlignAndCall {
+    input:
+      unmapped_bam = RevertSam.unmapped_bam,
+      base_name = base_name,
       mt_dict = mt_dict,
       mt_fasta = mt_fasta,
       mt_fasta_index = mt_fasta_index,
@@ -69,570 +109,297 @@ workflow AlignAndCall {
       mt_bwt = mt_bwt,
       mt_pac = mt_pac,
       mt_sa = mt_sa,
-      preemptible_tries = preemptible_tries
-  }
-
-  call AlignAndMarkDuplicates.AlignmentPipeline as AlignToShiftedMt {
-    input:
-      input_bam = unmapped_bam,
-      mt_dict = mt_shifted_dict,
-      mt_fasta = mt_shifted_fasta,
-      mt_fasta_index = mt_shifted_fasta_index,
-      mt_amb = mt_shifted_amb,
-      mt_ann = mt_shifted_ann,
-      mt_bwt = mt_shifted_bwt,
-      mt_pac = mt_shifted_pac,
-      mt_sa = mt_shifted_sa,
-      preemptible_tries = preemptible_tries
-  }
-
-  call CollectWgsMetrics {
-    input:
-      input_bam = AlignToMt.mt_aligned_bam,
-      input_bam_index = AlignToMt.mt_aligned_bai,
-      ref_fasta = mt_fasta,
-      ref_fasta_index = mt_fasta_index,
-      read_length = max_read_length,
-      coverage_cap = 100000,
-      preemptible_tries = preemptible_tries
-  }
-
-  Int? M2_mem = if CollectWgsMetrics.mean_coverage > 25000 then 14 else 7
-
-  call M2 as CallMt {
-    input:
-      input_bam = AlignToMt.mt_aligned_bam,
-      input_bai = AlignToMt.mt_aligned_bai,
-      ref_fasta = mt_fasta,
-      ref_fai = mt_fasta_index,
-      ref_dict = mt_dict,
-      compress = compress_output_vcf,
-      gatk_override = gatk_override,
-      gatk_docker_override = gatk_docker_override,
-      # Everything is called except the control region.
-      m2_extra_args = select_first([m2_extra_args, ""]) + " -L chrM:576-16024 ",
-      mem = M2_mem,
-      preemptible_tries = preemptible_tries
-  }
-
-  call M2 as CallShiftedMt {
-    input:
-      input_bam = AlignToShiftedMt.mt_aligned_bam,
-      input_bai = AlignToShiftedMt.mt_aligned_bai,
-      ref_fasta = mt_shifted_fasta,
-      ref_fai = mt_shifted_fasta_index,
-      ref_dict = mt_shifted_dict,
-      compress = compress_output_vcf,
-      gatk_override = gatk_override,
-      gatk_docker_override = gatk_docker_override,
-      # Everything is called except the control region.
-      m2_extra_args = select_first([m2_extra_args, ""]) + " -L chrM:8025-9144 ",
-      mem = M2_mem,
-      preemptible_tries = preemptible_tries
-  }
-
-  call LiftoverAndCombineVcfs {
-    input:
-      shifted_vcf = CallShiftedMt.raw_vcf,
-      vcf = CallMt.raw_vcf,
-      ref_fasta = mt_fasta,
-      ref_fasta_index = mt_fasta_index,
-      ref_dict = mt_dict,
+      blacklisted_sites = blacklisted_sites,
+      blacklisted_sites_index = blacklisted_sites_index,
+      mt_shifted_dict = mt_shifted_dict,
+      mt_shifted_fasta = mt_shifted_fasta,
+      mt_shifted_fasta_index = mt_shifted_fasta_index,
+      mt_shifted_amb = mt_shifted_amb,
+      mt_shifted_ann = mt_shifted_ann,
+      mt_shifted_bwt = mt_shifted_bwt,
+      mt_shifted_pac = mt_shifted_pac,
+      mt_shifted_sa = mt_shifted_sa,
       shift_back_chain = shift_back_chain,
-      preemptible_tries = preemptible_tries
-  }
-
-  call MergeStats {
-    input:
-      shifted_stats = CallShiftedMt.stats,
-      non_shifted_stats = CallMt.stats,
       gatk_override = gatk_override,
       gatk_docker_override = gatk_docker_override,
-      preemptible_tries = preemptible_tries
-  }
-
-  call Filter as InitialFilter {
-    input:
-      raw_vcf = LiftoverAndCombineVcfs.merged_vcf,
-      raw_vcf_index = LiftoverAndCombineVcfs.merged_vcf_index,
-      raw_vcf_stats = MergeStats.stats,
-      base_name = base_name,
-      ref_fasta = mt_fasta,
-      ref_fai = mt_fasta_index,
-      ref_dict = mt_dict,
-      compress = compress_output_vcf,
-      gatk_override = gatk_override,
-      gatk_docker_override = gatk_docker_override,
-      m2_extra_filtering_args = m2_filter_extra_args,
-      max_alt_allele_count = 4,
-      vaf_filter_threshold = 0,
-      blacklisted_sites = blacklisted_sites,
-      blacklisted_sites_index = blacklisted_sites_index,
-      f_score_beta = f_score_beta,
-      run_contamination = false,
-      preemptible_tries = preemptible_tries
-  }
-
- 
-  call SplitMultiAllelicsAndRemoveNonPassSites {
-    input:
-      ref_fasta = mt_fasta,
-      ref_fai = mt_fasta_index,
-      ref_dict = mt_dict,
-      filtered_vcf = InitialFilter.filtered_vcf,
-      gatk_override = gatk_override,
-      gatk_docker_override = gatk_docker_override
-  }
-
-  call GetContamination {
-    input:
-      input_vcf = SplitMultiAllelicsAndRemoveNonPassSites.vcf_for_haplochecker,
-      preemptible_tries = preemptible_tries
-  }
-
-  call Filter as FilterContamination {
-    input:
-      raw_vcf = InitialFilter.filtered_vcf,
-      raw_vcf_index = InitialFilter.filtered_vcf_idx,
-      raw_vcf_stats = MergeStats.stats,
-      run_contamination = true,
-      hasContamination = GetContamination.hasContamination,
-      contamination_major = GetContamination.major_level,
-      contamination_minor = GetContamination.minor_level,
-      verifyBamID = verifyBamID,
-      base_name = base_name,
-      ref_fasta = mt_fasta,
-      ref_fai = mt_fasta_index,
-      ref_dict = mt_dict,
-      compress = compress_output_vcf,
-      gatk_override = gatk_override,
-      gatk_docker_override = gatk_docker_override,
-      m2_extra_filtering_args = m2_filter_extra_args,
-      max_alt_allele_count = 4,
+      m2_extra_args = m2_extra_args,
+      m2_filter_extra_args = m2_filter_extra_args,
       vaf_filter_threshold = vaf_filter_threshold,
-      blacklisted_sites = blacklisted_sites,
-      blacklisted_sites_index = blacklisted_sites_index,
       f_score_beta = f_score_beta,
+      verifyBamID = verifyBamID,
+      compress_output_vcf = compress_output_vcf,
+      max_read_length = max_read_length,
       preemptible_tries = preemptible_tries
- }
+  }
+
+  # This is a temporary task to handle "joint calling" until Mutect2 can produce a GVCF.
+  # This proivdes coverage at each base so low coverage sites can be considered ./. rather than 0/0.
+  call CoverageAtEveryBase {
+    input:
+      input_bam_regular_ref = AlignAndCall.mt_aligned_bam,
+      input_bam_regular_ref_index = AlignAndCall.mt_aligned_bai,
+      input_bam_shifted_ref = AlignAndCall.mt_aligned_shifted_bam,
+      input_bam_shifted_ref_index = AlignAndCall.mt_aligned_shifted_bai,
+      shift_back_chain = shift_back_chain,
+      control_region_shifted_reference_interval_list = control_region_shifted_reference_interval_list,
+      non_control_region_interval_list = non_control_region_interval_list,
+      ref_fasta = mt_fasta,
+      ref_fasta_index = mt_fasta_index,
+      ref_dict = mt_dict,
+      shifted_ref_fasta = mt_shifted_fasta,
+      shifted_ref_fasta_index = mt_shifted_fasta_index,
+      shifted_ref_dict = mt_shifted_dict
+  }
+  
+  call SplitMultiAllelicSites {
+    input:
+      input_vcf = AlignAndCall.out_vcf,
+      base_name = base_name,
+      ref_fasta = mt_fasta,
+      ref_fasta_index = mt_fasta_index,
+      ref_dict = mt_dict,
+      gatk_override = gatk_override,
+      gatk_docker_override = gatk_docker_override,
+      preemptible_tries = preemptible_tries
+  }
 
   output {
-    File mt_aligned_bam = AlignToMt.mt_aligned_bam
-    File mt_aligned_bai = AlignToMt.mt_aligned_bai
-    File mt_aligned_shifted_bam = AlignToShiftedMt.mt_aligned_bam
-    File mt_aligned_shifted_bai = AlignToShiftedMt.mt_aligned_bai
-    File out_vcf = FilterContamination.filtered_vcf
-    File out_vcf_index = FilterContamination.filtered_vcf_idx
-    File input_vcf_for_haplochecker = SplitMultiAllelicsAndRemoveNonPassSites.vcf_for_haplochecker
-    File duplicate_metrics = AlignToMt.duplicate_metrics
-    File coverage_metrics = CollectWgsMetrics.metrics
-    File theoretical_sensitivity_metrics = CollectWgsMetrics.theoretical_sensitivity
-    File contamination_metrics = GetContamination.contamination_file
-    Int mean_coverage = CollectWgsMetrics.mean_coverage
-    Float median_coverage = CollectWgsMetrics.median_coverage
-    String major_haplogroup = GetContamination.major_hg
-    Float contamination = FilterContamination.contamination
+    File subset_bam = SubsetBamToChrM.output_bam
+    File subset_bai = SubsetBamToChrM.output_bai
+    File mt_aligned_bam = AlignAndCall.mt_aligned_bam
+    File mt_aligned_bai = AlignAndCall.mt_aligned_bai
+    File out_vcf = AlignAndCall.out_vcf
+    File out_vcf_index = AlignAndCall.out_vcf_index
+    File split_vcf = SplitMultiAllelicSites.split_vcf
+    File split_vcf_index = SplitMultiAllelicSites.split_vcf_index
+    File input_vcf_for_haplochecker = AlignAndCall.input_vcf_for_haplochecker
+    File duplicate_metrics = AlignAndCall.duplicate_metrics
+    File coverage_metrics = AlignAndCall.coverage_metrics
+    File theoretical_sensitivity_metrics = AlignAndCall.theoretical_sensitivity_metrics
+    File contamination_metrics = AlignAndCall.contamination_metrics
+    File base_level_coverage_metrics = CoverageAtEveryBase.table
+    Int mean_coverage = AlignAndCall.mean_coverage
+    Float median_coverage = AlignAndCall.median_coverage
+    String major_haplogroup = AlignAndCall.major_haplogroup
+    Float contamination = AlignAndCall.contamination
   }
 }
 
-
-task GetContamination {
-  input {
-    File input_vcf
-    # runtime
-    Int? preemptible_tries
-  }
-
-  Int disk_size = ceil(size(input_vcf, "GB")) + 20
-
-  meta {
-    description: "Uses new Haplochecker to estimate levels of contamination in mitochondria"
-  }
-  parameter_meta {
-    input_vcf: "Filtered and split multi-allelic sites VCF for mitochondria"
-  }
-  command <<<
-  set -e
-  PARENT_DIR="$(dirname "~{input_vcf}")"
-  java -jar /usr/mtdnaserver/haplocheckCLI.jar "${PARENT_DIR}"
-
-  sed 's/\"//g' output > output-noquotes
-
-  grep "SampleID" output-noquotes > headers
-  FORMAT_ERROR="Bad contamination file format"
-  if [ `awk '{print $2}' headers` != "Contamination" ]; then
-    echo $FORMAT_ERROR; exit 1
-  fi
-  if [ `awk '{print $6}' headers` != "HgMajor" ]; then
-    echo $FORMAT_ERROR; exit 1
-  fi
-  if [ `awk '{print $8}' headers` != "HgMinor" ]; then
-    echo $FORMAT_ERROR; exit 1
-  fi
-  if [ `awk '{print $14}' headers` != "MeanHetLevelMajor" ]; then
-    echo $FORMAT_ERROR; exit 1
-  fi
-  if [ `awk '{print $15}' headers` != "MeanHetLevelMinor" ]; then
-    echo $FORMAT_ERROR; exit 1
-  fi
-
-  grep -v "SampleID" output-noquotes > output-data
-  awk -F "\t" '{print $2}' output-data > contamination.txt
-  awk -F "\t" '{print $6}' output-data > major_hg.txt
-  awk -F "\t" '{print $8}' output-data > minor_hg.txt
-  awk -F "\t" '{print $14}' output-data > mean_het_major.txt
-  awk -F "\t" '{print $15}' output-data > mean_het_minor.txt
-  >>>
-  runtime {
-    preemptible: select_first([preemptible_tries, 5])
-    memory: "3 GB"
-    disks: "local-disk " + disk_size + " HDD"
-    docker: "us.gcr.io/broad-dsde-methods/haplochecker:haplochecker-0124"
-  }
-  output {
-    File contamination_file = "output-noquotes"
-    String hasContamination = read_string("contamination.txt") 
-    String major_hg = read_string("major_hg.txt")
-    String minor_hg = read_string("minor_hg.txt")
-    Float major_level = read_float("mean_het_major.txt")
-    Float minor_level = read_float("mean_het_minor.txt")
-  }
-}
-
-task CollectWgsMetrics {
+task SubsetBamToChrM {
   input {
     File input_bam
-    File input_bam_index
-    File ref_fasta
-    File ref_fasta_index
-    Int? read_length
-    Int? coverage_cap
+    File input_bai
+    String contig_name
+    String basename = basename(basename(input_bam, ".cram"), ".bam")
+    String? requester_pays_project
+    File? ref_fasta
+    File? ref_fasta_index
+    File? ref_dict
+
+    File? gatk_override
+    String? gatk_docker_override
 
     # runtime
     Int? preemptible_tries
-    Int disk_size = ceil(size(input_bam, "GB") + size(ref_fasta, "GB") + size(ref_fasta_index, "GB")) + 20
     Int mem = 3
   }
-
-  Int read_length_for_optimization = select_first([read_length, 151])
+  Float ref_size = if defined(ref_fasta) then size(ref_fasta, "GB") + size(ref_fasta_index, "GB") + size(ref_dict, "GB") else 0
+  Int disk_size = ceil(size(input_bam, "GB") + ref_size) + 20
 
   meta {
-    description: "Collect coverage metrics"
+    description: "Subsets a whole genome bam to just Mitochondria reads"
   }
   parameter_meta {
-    read_length: "Read length used for optimization only. If this is too small CollectWgsMetrics might fail. Default is 151."
+    ref_fasta: "Reference is only required for cram input. If it is provided ref_fasta_index and ref_dict are also required."
+    input_bam: {
+      localization_optional: true
+    }
+    input_bai: {
+      localization_optional: true
+    }
+  }
+  command <<<
+    set -e
+    export GATK_LOCAL_JAR=~{default="/root/gatk.jar" gatk_override}
+
+    gatk PrintReads \
+      ~{"-R " + ref_fasta} \
+      -L ~{contig_name} \
+      --read-filter MateOnSameContigOrNoMappedMateReadFilter \
+      --read-filter MateUnmappedAndUnmappedReadFilter \
+      ~{"--gcs-project-for-requester-pays " + requester_pays_project} \
+      -I ~{input_bam} \
+      --read-index ~{input_bai} \
+      -O ~{basename}.bam
+  >>>
+  runtime {
+    memory: mem + " GB"
+    disks: "local-disk " + disk_size + " HDD"
+    docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
+    preemptible: select_first([preemptible_tries, 5])
+  }
+  output {
+    File output_bam = "~{basename}.bam"
+    File output_bai = "~{basename}.bai"
+  }
+}
+
+task RevertSam {
+  input {
+    File input_bam
+    String basename = basename(input_bam, ".bam")
+
+    # runtime
+    Int? preemptible_tries
+    Int machine_mem = 2000
+    Int disk_size = ceil(size(input_bam, "GB") * 2.5) + 20
+  }
+  Int java_mem = machine_mem - 1000
+
+  meta {
+    description: "Removes alignment information while retaining recalibrated base qualities and original alignment tags"
+  }
+  parameter_meta {
+    input_bam: "aligned bam"
+  }
+  command {
+    java -Xmx~{java_mem}m -jar /usr/gitc/picard.jar \
+    RevertSam \
+    INPUT=~{input_bam} \
+    OUTPUT_BY_READGROUP=false \
+    OUTPUT=~{basename}.bam \
+    VALIDATION_STRINGENCY=LENIENT \
+    ATTRIBUTE_TO_CLEAR=FT \
+    ATTRIBUTE_TO_CLEAR=CO \
+    SORT_ORDER=queryname \
+    RESTORE_ORIGINAL_QUALITIES=false
+  }
+  runtime {
+    disks: "local-disk " + disk_size + " HDD"
+    memory: machine_mem + " MB"
+    docker: "us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.4.2-1552931386"
+    preemptible: select_first([preemptible_tries, 5])
+  }
+  output {
+    File unmapped_bam = "~{basename}.bam"
+  }
+}
+
+task CoverageAtEveryBase {
+  input {
+    File input_bam_regular_ref
+    File input_bam_regular_ref_index
+    File input_bam_shifted_ref
+    File input_bam_shifted_ref_index
+    File shift_back_chain
+    File control_region_shifted_reference_interval_list
+    File non_control_region_interval_list
+    File ref_fasta
+    File ref_fasta_index
+    File ref_dict
+    File shifted_ref_fasta
+    File shifted_ref_fasta_index
+    File shifted_ref_dict
+
+    # runtime
+    Int? preemptible_tries
+    Int disk_size = ceil(size(input_bam_regular_ref, "GB") + size(input_bam_shifted_ref, "GB") + size(ref_fasta, "GB") * 2) + 20
   }
 
+  meta {
+    description: "Remove this hack once there's a GVCF solution."
+  }
   command <<<
     set -e
 
-    java -Xms2000m -jar /usr/gitc/picard.jar \
-      CollectWgsMetrics \
-      INPUT=~{input_bam} \
-      VALIDATION_STRINGENCY=SILENT \
-      REFERENCE_SEQUENCE=~{ref_fasta} \
-      OUTPUT=metrics.txt \
-      USE_FAST_ALGORITHM=true \
-      READ_LENGTH=~{read_length_for_optimization} \
-      ~{"COVERAGE_CAP=" + coverage_cap} \
-      INCLUDE_BQ_HISTOGRAM=true \
-      THEORETICAL_SENSITIVITY_OUTPUT=theoretical_sensitivity.txt
+    java -jar /usr/gitc/picard.jar CollectHsMetrics \
+      I=~{input_bam_regular_ref} \
+      R=~{ref_fasta} \
+      PER_BASE_COVERAGE=non_control_region.tsv \
+      O=non_control_region.metrics \
+      TI=~{non_control_region_interval_list} \
+      BI=~{non_control_region_interval_list} \
+      COVMAX=20000 \
+      SAMPLE_SIZE=1
+
+    java -jar /usr/gitc/picard.jar CollectHsMetrics \
+      I=~{input_bam_shifted_ref} \
+      R=~{shifted_ref_fasta} \
+      PER_BASE_COVERAGE=control_region_shifted.tsv \
+      O=control_region_shifted.metrics \
+      TI=~{control_region_shifted_reference_interval_list} \
+      BI=~{control_region_shifted_reference_interval_list} \
+      COVMAX=20000 \
+      SAMPLE_SIZE=1
 
     R --vanilla <<CODE
-      df = read.table("metrics.txt",skip=6,header=TRUE,stringsAsFactors=FALSE,sep='\t',nrows=1)
-      write.table(floor(df[,"MEAN_COVERAGE"]), "mean_coverage.txt", quote=F, col.names=F, row.names=F)
-      write.table(df[,"MEDIAN_COVERAGE"], "median_coverage.txt", quote=F, col.names=F, row.names=F)
+      shift_back = function(x) {
+        if (x < 8570) {
+          return(x + 8000)
+        } else {
+          return (x - 8569)
+        }
+      }
+
+      control_region_shifted = read.table("control_region_shifted.tsv", header=T)
+      shifted_back = sapply(control_region_shifted[,"pos"], shift_back)
+      control_region_shifted[,"pos"] = shifted_back
+
+      beginning = subset(control_region_shifted, control_region_shifted[,'pos']<8000)
+      end = subset(control_region_shifted, control_region_shifted[,'pos']>8000)
+
+      non_control_region = read.table("non_control_region.tsv", header=T)
+      combined_table = rbind(beginning, non_control_region, end)
+      write.table(combined_table, "per_base_coverage.tsv", row.names=F, col.names=T, quote=F, sep="\t")
+
     CODE
   >>>
   runtime {
-    preemptible: select_first([preemptible_tries, 5])
-    memory: mem + " GB"
     disks: "local-disk " + disk_size + " HDD"
+    memory: "1200 MB"
     docker: "us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.4.2-1552931386"
+    preemptible: select_first([preemptible_tries, 5])
   }
   output {
-    File metrics = "metrics.txt"
-    File theoretical_sensitivity = "theoretical_sensitivity.txt"
-    Int mean_coverage = read_int("mean_coverage.txt")
-    Float median_coverage = read_float("median_coverage.txt")
+    File table = "per_base_coverage.tsv"
   }
 }
 
-task LiftoverAndCombineVcfs {
+task SplitMultiAllelicSites {
   input {
-    File shifted_vcf
-    File vcf
-    String basename = basename(shifted_vcf, ".vcf")
-
     File ref_fasta
     File ref_fasta_index
     File ref_dict
-
-    File shift_back_chain
-
-    # runtime
-    Int? preemptible_tries
-  }
-
-  Float ref_size = size(ref_fasta, "GB") + size(ref_fasta_index, "GB")
-  Int disk_size = ceil(size(shifted_vcf, "GB") + ref_size) + 20
-
-  meta {
-    description: "Lifts over shifted vcf of control region and combines it with the rest of the chrM calls."
-  }
-  parameter_meta {
-    shifted_vcf: "VCF of control region on shifted reference"
-    vcf: "VCF of the rest of chrM on original reference"
-    ref_fasta: "Original (not shifted) chrM reference"
-    shift_back_chain: "Chain file to lift over from shifted reference to original chrM"
-  }
-  command<<<
-    set -e
-
-    java -jar /usr/gitc/picard.jar LiftoverVcf \
-      I=~{shifted_vcf} \
-      O=~{basename}.shifted_back.vcf \
-      R=~{ref_fasta} \
-      CHAIN=~{shift_back_chain} \
-      REJECT=~{basename}.rejected.vcf
-
-    java -jar /usr/gitc/picard.jar MergeVcfs \
-      I=~{basename}.shifted_back.vcf \
-      I=~{vcf} \
-      O=~{basename}.merged.vcf
-    >>>
-    runtime {
-      disks: "local-disk " + disk_size + " HDD"
-      memory: "1200 MB"
-      docker: "us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.4.2-1552931386"
-      preemptible: select_first([preemptible_tries, 5])
-    }
-    output{
-        # rejected_vcf should always be empty
-        File rejected_vcf = "~{basename}.rejected.vcf"
-        File merged_vcf = "~{basename}.merged.vcf"
-        File merged_vcf_index = "~{basename}.merged.vcf.idx"
-    }
-}
-
-task M2 {
-  input {
-    File ref_fasta
-    File ref_fai
-    File ref_dict
-    File input_bam
-    File input_bai
-    Int max_reads_per_alignment_start = 75
-    String? m2_extra_args
-    Boolean? make_bamout
-    Boolean compress
-    File? gatk_override
-   
-    # runtime
-    String? gatk_docker_override
-    Int? mem
-    Int? preemptible_tries
-    Int disk_size = ceil(size(input_bam, "GB") + size(ref_fasta, "GB") + size(ref_fai, "GB")) + 20
-  }
-
-  String output_vcf = "raw" + if compress then ".vcf.gz" else ".vcf"
-  String output_vcf_index = output_vcf + if compress then ".tbi" else ".idx"
-
-  # Mem is in units of GB but our command and memory runtime values are in MB
-  Int machine_mem = if defined(mem) then mem * 1000 else 3500
-  Int command_mem = machine_mem - 500
-
-  meta {
-    description: "Mutect2 for calling Snps and Indels"
-  }
-  parameter_meta {
-    input_bam: "Aligned Bam"
-  }
-  command <<<
-      set -e
-
-      export GATK_LOCAL_JAR=~{default="/root/gatk.jar" gatk_override}
-
-      # We need to create these files regardless, even if they stay empty
-      touch bamout.bam
-
-      gatk --java-options "-Xmx~{command_mem}m" Mutect2 \
-        -R ~{ref_fasta} \
-        -I ~{input_bam} \
-        --read-filter MateOnSameContigOrNoMappedMateReadFilter \
-        --read-filter MateUnmappedAndUnmappedReadFilter \
-        -O ~{output_vcf} \
-        ~{true='--bam-output bamout.bam' false='' make_bamout} \
-        ~{m2_extra_args} \
-        --annotation StrandBiasBySample \
-        --mitochondria-mode \
-        --max-reads-per-alignment-start ~{max_reads_per_alignment_start} \
-        --max-mnp-distance 0
-  >>>
-  runtime {
-      docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
-      memory: machine_mem + " MB"
-      disks: "local-disk " + disk_size + " HDD"
-      preemptible: select_first([preemptible_tries, 5])
-      cpu: 2
-  }
-  output {
-      File raw_vcf = "~{output_vcf}"
-      File raw_vcf_idx = "~{output_vcf_index}"
-      File stats = "~{output_vcf}.stats"
-      File output_bamOut = "bamout.bam"
-  }
-}
-
-task Filter {
-  input {
-    File ref_fasta
-    File ref_fai
-    File ref_dict
-    File raw_vcf
-    File raw_vcf_index
-    File raw_vcf_stats
-    Boolean compress
-    Float? vaf_cutoff
+    File input_vcf
     String base_name
-
-    String? m2_extra_filtering_args
-    Int max_alt_allele_count
-    Float? vaf_filter_threshold
-    Float? f_score_beta
-
-    Boolean run_contamination
-    String? hasContamination
-    Float? contamination_major
-    Float? contamination_minor
-    Float? verifyBamID
-     
-    File blacklisted_sites
-    File blacklisted_sites_index
-
-    File? gatk_override
-    String? gatk_docker_override
-
-  # runtime
-    Int? preemptible_tries
-  }
-
-  String output_vcf = base_name + if compress then ".vcf.gz" else ".vcf"
-  String output_vcf_index = output_vcf + if compress then ".tbi" else ".idx"
-  Float ref_size = size(ref_fasta, "GB") + size(ref_fai, "GB")
-  Int disk_size = ceil(size(raw_vcf, "GB") + ref_size) + 20
-  Float hc_contamination = if run_contamination && hasContamination == "YES" then (if contamination_major == 0.0 then contamination_minor else 1.0 - contamination_major) else 0.0
-  Float max_contamination = if defined(verifyBamID) && verifyBamID > hc_contamination then verifyBamID else hc_contamination
-
-  meta {
-    description: "Mutect2 Filtering for calling Snps and Indels"
-  }
-  parameter_meta {
-      vaf_filter_threshold: "Hard cutoff for minimum allele fraction. All sites with VAF less than this cutoff will be filtered."
-      f_score_beta: "F-Score beta balances the filtering strategy between recall and precision. The relative weight of recall to precision."
-  }
-  command <<<
-      set -e
-
-      export GATK_LOCAL_JAR=~{default="/root/gatk.jar" gatk_override}
-
-      # We need to create these files regardless, even if they stay empty
-      touch bamout.bam
-
-      gatk --java-options "-Xmx2500m" FilterMutectCalls -V ~{raw_vcf} \
-        -R ~{ref_fasta} \
-        -O filtered.vcf \
-        --stats ~{raw_vcf_stats} \
-        ~{m2_extra_filtering_args} \
-        --max-alt-allele-count ~{max_alt_allele_count} \
-        --mitochondria-mode \
-        ~{"--min-allele-fraction " + vaf_filter_threshold} \
-        ~{"--f-score-beta " + f_score_beta} \
-        ~{"--contamination-estimate " + max_contamination}
-
-      gatk VariantFiltration -V filtered.vcf \
-        -O ~{output_vcf} \
-        --apply-allele-specific-filters \
-        --mask ~{blacklisted_sites} \
-        --mask-name "blacklisted_site"
-
-  >>>
-  runtime {
-      docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
-      memory: "4 MB"
-      disks: "local-disk " + disk_size + " HDD"
-      preemptible: select_first([preemptible_tries, 5])
-      cpu: 2
-  }
-  output {
-      File filtered_vcf = "~{output_vcf}"
-      File filtered_vcf_idx = "~{output_vcf_index}"
-      Float contamination = "~{hc_contamination}"
-  }
-}
-
-task MergeStats {
-  input {
-    File shifted_stats
-    File non_shifted_stats
     Int? preemptible_tries
     File? gatk_override
     String? gatk_docker_override
   }
 
-  command{
-    set -e
-
-    export GATK_LOCAL_JAR=~{default="/root/gatk.jar" gatk_override}
-
-    gatk MergeMutectStats --stats ~{shifted_stats} --stats ~{non_shifted_stats} -O raw.combined.stats
-  }
-  output {
-    File stats = "raw.combined.stats"
-  }
-  runtime {
-      docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
-      memory: "3 MB"
-      disks: "local-disk 20 HDD"
-      preemptible: select_first([preemptible_tries, 5])
-  }
-}
-
-task SplitMultiAllelicsAndRemoveNonPassSites {
-  input {
-    File ref_fasta
-    File ref_fai
-    File ref_dict
-    File filtered_vcf
-    Int? preemptible_tries
-    File? gatk_override
-    String? gatk_docker_override
-  }
+  String output_vcf = base_name + ".final.split.vcf"
+  String output_vcf_index = output_vcf + ".idx"
 
   command {
     set -e
     export GATK_LOCAL_JAR=~{default="/root/gatk.jar" gatk_override}
     gatk LeftAlignAndTrimVariants \
       -R ~{ref_fasta} \
-      -V ~{filtered_vcf} \
-      -O split.vcf \
+      -V ~{input_vcf} \
+      -O ~{output_vcf} \
       --split-multi-allelics \
       --dont-trim-alleles \
       --keep-original-ac
-
-      gatk SelectVariants \
-        -V split.vcf \
-        -O splitAndPassOnly.vcf \
-        --exclude-filtered
-  
   }
   output {
-    File vcf_for_haplochecker = "splitAndPassOnly.vcf"
+    File split_vcf = "~{output_vcf}"
+    File split_vcf_index = "~{output_vcf}"
   }
   runtime {
       docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
-      memory: "3 MB"
+      memory: "4 MiB"
       disks: "local-disk 20 HDD"
       preemptible: select_first([preemptible_tries, 5])
   } 
 }
+
