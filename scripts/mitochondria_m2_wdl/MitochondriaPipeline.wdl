@@ -397,8 +397,9 @@ task SplitMultiAllelicSites {
   }
   runtime {
       docker: select_first([gatk_docker_override, "us.gcr.io/broad-gatk/gatk:4.1.7.0"])
-      memory: "3 MB"
+      memory: "4 MiB"
       disks: "local-disk 20 HDD"
       preemptible: select_first([preemptible_tries, 5])
   } 
 }
+
